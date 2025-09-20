@@ -2,121 +2,152 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# hyperparameters
-batch_size = 32 # how many independent sequences will we process in parallel?
-block_size = 8 # what is the maximum context length for predictions?
-max_iters = 3000
-eval_interval = 300
-learning_rate = 1e-2
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 200
-# ------------
+# ---------------------------
+# Hyperparameters (config)
+# ---------------------------
+BATCH_SIZE = 32  # câte secvențe procesăm în paralel
+BLOCK_SIZE = (
+    8  # cât de mult context (cuvinte/tokens) citim înainte să prezicem următorul
+)
+MAX_ITERS = 3000
+EVAL_INTERVAL = 300  # la câți pași facem evaluare pe datele de validare
+LEARNING_RATE = 1e-2
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+EVAL_ITERS = 200  # câte batchuri evaluăm ca să facem media pierderii (loss)
 
+# Setăm seed-ul ca să avem rezultate reproducibile
 torch.manual_seed(1337)
 
-# wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-with open('input.txt', 'r', encoding='utf-8') as f:
+# ---------------------------
+# Încărcăm și procesăm datele
+# ---------------------------
+with open("input.txt", "r", encoding="utf-8") as f:
     text = f.read()
 
-# here are all the unique characters that occur in this text
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
-# create a mapping from characters to integers
-stoi = { ch:i for i,ch in enumerate(chars) }
-itos = { i:ch for i,ch in enumerate(chars) }
-encode = lambda s: [stoi[c] for c in s] # encoder: take a string, output a list of integers
-decode = lambda l: ''.join([itos[i] for i in l]) # decoder: take a list of integers, output a string
+# Extragem toate caracterele unice din text și creăm un vocabular
+unique_chars = sorted(list(set(text)))
+VOCAB_SIZE = len(unique_chars)
 
-# Train and test splits
+# Dicționare pentru a converti caracter <-> index
+char_to_index = {ch: i for i, ch in enumerate(unique_chars)}
+index_to_char = {i: ch for i, ch in enumerate(unique_chars)}
+
+# Functii pentru encoding/decoding (string -> listă de indici și invers)
+encode = lambda s: [char_to_index[c] for c in s]
+decode = lambda l: "".join([index_to_char[i] for i in l])
+
+# Convertim tot textul într-un tensor de indici
 data = torch.tensor(encode(text), dtype=torch.long)
-n = int(0.9*len(data)) # first 90% will be train, rest val
-train_data = data[:n]
-val_data = data[n:]
 
-# data loading
+# Împărțim datele: 90% pentru antrenament, 10% pentru validare
+split_idx = int(0.9 * len(data))
+train_data = data[:split_idx]
+val_data = data[split_idx:]
+
+
+# ---------------------------
+# Funcție pentru a genera batchuri
+# ---------------------------
 def get_batch(split):
-    # generate a small batch of data of inputs x and targets y
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
+    dataset = train_data if split == "train" else val_data
+    # Alegem random puncte de start pentru fiecare secvență
+    start_indices = torch.randint(len(dataset) - BLOCK_SIZE, (BATCH_SIZE,))
 
+    # Construim inputul x și ținta y (care este inputul shift-uit la dreapta cu 1)
+    input_batch = torch.stack([dataset[i : i + BLOCK_SIZE] for i in start_indices])
+    target_batch = torch.stack(
+        [dataset[i + 1 : i + BLOCK_SIZE + 1] for i in start_indices]
+    )
+    return input_batch.to(DEVICE), target_batch.to(DEVICE)
+
+
+# ---------------------------
+# Estimăm loss-ul mediu pe train și val (fără gradient)
+# ---------------------------
 @torch.no_grad()
 def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
+    loss_results = {}
+    model.eval()  # dezactivăm dropout etc.
+    for split in ["train", "val"]:
+        split_losses = torch.zeros(EVAL_ITERS)
+        for k in range(EVAL_ITERS):
             X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
+            _, loss = model(X, Y)
+            split_losses[k] = loss.item()
+        loss_results[split] = split_losses.mean()
+    model.train()  # revenim la mod de training
+    return loss_results
 
-# super simple bigram model
+
+# ---------------------------
+# Modelul propriu-zis
+# ---------------------------
 class BigramLanguageModel(nn.Module):
-
     def __init__(self, vocab_size):
         super().__init__()
-        # each token directly reads off the logits for the next token from a lookup table
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        # Fiecare token (caracter) va avea un rând în această matrice care spune ce scoruri (logits) să dea altor tokeni
+        self.token_embedding_lookup = nn.Embedding(vocab_size, vocab_size)
 
-    def forward(self, idx, targets=None):
+    def forward(self, input_tokens, target_tokens=None):
+        # Primim un tensor de indici: formă (batch, time)
+        # Îi mapăm direct la logits: scoruri brute pt. fiecare token următor posibil
+        logits = self.token_embedding_lookup(input_tokens)  # Formă: (B, T, C)
 
-        # idx and targets are both (B,T) tensor of integers
-        logits = self.token_embedding_table(idx) # (B,T,C)
+        if target_tokens is None:
+            return logits, None  # Dacă nu avem ținte, returnăm doar predicțiile
 
-        if targets is None:
-            loss = None
-        else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
+        # Altfel, calculăm cross-entropy loss
+        B, T, C = logits.shape
+        logits_flat = logits.view(B * T, C)
+        targets_flat = target_tokens.view(B * T)
+        loss = F.cross_entropy(logits_flat, targets_flat)
 
         return logits, loss
 
-    def generate(self, idx, max_new_tokens):
-        # idx is (B, T) array of indices in the current context
+    def generate(self, context_tokens, max_new_tokens):
+        # Pornim de la un context (ex: un caracter) și generăm max_new_tokens caractere noi
         for _ in range(max_new_tokens):
-            # get the predictions
-            logits, loss = self(idx)
-            # focus only on the last time step
-            logits = logits[:, -1, :] # becomes (B, C)
-            # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1) # (B, C)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
-            # append sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
-        return idx
+            logits, _ = self(context_tokens)
+            last_logits = logits[:, -1, :]  # ne uităm doar la ultimul pas din secvență
+            probs = F.softmax(
+                last_logits, dim=-1
+            )  # transformăm logits în probabilități
+            next_token = torch.multinomial(
+                probs, num_samples=1
+            )  # alegem un token aleator conform probabilităților
+            context_tokens = torch.cat(
+                (context_tokens, next_token), dim=1
+            )  # adăugăm tokenul generat la secvență
+        return context_tokens
 
-model = BigramLanguageModel(vocab_size)
-m = model.to(device)
 
-# create a PyTorch optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+# ---------------------------
+# Inițializăm modelul și optimizerul
+# ---------------------------
+model = BigramLanguageModel(VOCAB_SIZE).to(DEVICE)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
-for iter in range(max_iters):
-
-    # every once in a while evaluate the loss on train and val sets
-    if iter % eval_interval == 0:
+# ---------------------------
+# Loop-ul de antrenament
+# ---------------------------
+for iteration in range(MAX_ITERS):
+    if iteration % EVAL_INTERVAL == 0:
         losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(
+            f"Step {iteration}: Train Loss {losses['train']:.4f}, Val Loss {losses['val']:.4f}"
+        )
 
-    # sample a batch of data
-    xb, yb = get_batch('train')
-
-    # evaluate the loss
-    logits, loss = model(xb, yb)
+    x_batch, y_batch = get_batch("train")
+    logits, loss = model(x_batch, y_batch)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
 
-# generate from the model
-context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+# ---------------------------
+# Generăm text nou după antrenament
+# ---------------------------
+initial_context = torch.zeros(
+    (1, 1), dtype=torch.long, device=DEVICE
+)  # începem cu caracterul 0 (de obicei \n)
+output_sequence = model.generate(initial_context, max_new_tokens=500)
+print(decode(output_sequence[0].tolist()))
